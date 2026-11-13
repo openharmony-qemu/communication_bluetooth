@@ -51,6 +51,7 @@ napi_value DefineConnectionFunctions(napi_env env, napi_value exports)
         DECLARE_NAPI_FUNCTION("getBtConnectionState", GetBtConnectionState),
         DECLARE_NAPI_FUNCTION("pairDevice", PairDeviceAsync),
         DECLARE_NAPI_FUNCTION("pairDeviceOutOfBand", PairDeviceOutOfBand),
+        DECLARE_NAPI_FUNCTION("startPairOutOfBand", StartPairOutOfBand),
         DECLARE_NAPI_FUNCTION("generateLocalOobData", GenerateLocalOobData),
         DECLARE_NAPI_FUNCTION("cancelPairedDevice", CancelPairedDeviceAsync),
         DECLARE_NAPI_FUNCTION("getProfileConnectionState", GetProfileConnectionStateEx),
@@ -795,6 +796,66 @@ napi_status CheckPairDeviceOobParam(napi_env env, napi_callback_info info, Addre
     NAPI_BT_CALL_RETURN(ParseOobDataParam(env, argv[PARAM1], transport, addressInfo, oobData));
     oobData.SetOobDataType(OobDataType::P192);
     return napi_ok;
+}
+
+
+napi_status CheckStartPairOobParam(napi_env env, napi_callback_info info, std::string &remoteAddr,
+    int32_t &transport, OobData &oobData)
+{
+    // Read one extra slot so a fifth argument is rejected rather than hidden.
+    constexpr size_t MAX_ARGUMENTS = 5;
+    size_t argc = MAX_ARGUMENTS;
+    napi_value argv[MAX_ARGUMENTS] = {nullptr};
+    NAPI_BT_CALL_RETURN(napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr));
+    NAPI_BT_RETURN_IF(argc < ARGS_SIZE_THREE || argc > ARGS_SIZE_FOUR, "Requires 3 or 4 arguments", napi_invalid_arg);
+    NAPI_BT_CALL_RETURN(NapiParseBdAddr(env, argv[PARAM0], remoteAddr));
+    NAPI_BT_RETURN_IF(!ParseInt32(env, transport, argv[PARAM1]), "Parse transport failed", napi_invalid_arg);
+    double requestedTransport = 0;
+    NAPI_BT_CALL_RETURN(napi_get_value_double(env, argv[PARAM1], &requestedTransport));
+    NAPI_BT_RETURN_IF(!IsValidTransport(transport) || requestedTransport != transport, "invalid transport", napi_invalid_arg);
+
+    napi_valuetype p192 = napi_undefined;
+    napi_valuetype p256 = napi_undefined;
+    NAPI_BT_CALL_RETURN(napi_typeof(env, argv[PARAM2], &p192));
+    if (argc == ARGS_SIZE_FOUR) {
+        NAPI_BT_CALL_RETURN(napi_typeof(env, argv[PARAM3], &p256));
+    }
+    NAPI_BT_RETURN_IF((p192 != napi_undefined && p192 != napi_object) ||
+        (p256 != napi_undefined && p256 != napi_object), "OOB data must be objects or undefined", napi_invalid_arg);
+    NAPI_BT_RETURN_IF(p192 == napi_undefined && p256 == napi_undefined, "At least one OOB data is required", napi_invalid_arg);
+    // OobData still contains its raw peer address/type. The separate public
+    // deviceId can be a virtual address; it identifies the actual pair target.
+    AddressInfo rawPeer;
+    if (p192 != napi_undefined) {
+        NAPI_BT_CALL_RETURN(ParseOobDataParam(env, argv[PARAM2], transport, rawPeer, oobData));
+        oobData.SetOobDataType(OobDataType::P192);
+    }
+    if (p256 != napi_undefined) {
+        // SDK API26 selects P256, but every supplied object must be valid.
+        OobData p256Data;
+        NAPI_BT_CALL_RETURN(ParseOobDataParam(env, argv[PARAM3], transport, rawPeer, p256Data));
+        p256Data.SetOobDataType(OobDataType::P256);
+        oobData = p256Data;
+    }
+    return napi_ok;
+}
+
+napi_value StartPairOutOfBand(napi_env env, napi_callback_info info)
+{
+    auto haUtils = std::make_shared<NapiHaEventUtils>(env, "connection.StartPairOutOfBand");
+    std::string remoteAddr;
+    int32_t transport = BT_TRANSPORT_NONE;
+    OobData oobData;
+    auto check = CheckStartPairOobParam(env, info, remoteAddr, transport, oobData);
+    NAPI_BT_ASSERT_RETURN_UNDEF(env, check == napi_ok, BT_ERR_INVALID_PARAM);
+    auto execute = [remoteAddr, transport, oobData]() {
+        BluetoothRemoteDevice remoteDevice(remoteAddr, transport);
+        return NapiAsyncWorkRet(remoteDevice.StartPairOutOfBand(oobData));
+    };
+    auto work = NapiAsyncWorkFactory::CreateAsyncWork(env, info, execute, ASYNC_WORK_NO_NEED_CALLBACK, haUtils);
+    NAPI_BT_ASSERT_RETURN_UNDEF(env, work, BT_ERR_INTERNAL_ERROR);
+    work->Run();
+    return work->GetRet();
 }
 
 napi_value PairDeviceOutOfBand(napi_env env, napi_callback_info info)
